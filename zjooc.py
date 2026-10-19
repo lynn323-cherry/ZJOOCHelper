@@ -5,6 +5,8 @@ from pprint import pprint
 import ddddocr
 import html2text
 import requests
+import urllib3
+urllib3.disable_warnings()
 
 Headers = {
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -20,19 +22,23 @@ def get_captcha() -> dict:  # 获取验证码信息
     captcha_headers = {
         "User-Agent": "Mozilla/5.0(WindowsNT10.0;Win64;x64)AppleWebKit/537.36(KHTML,likeGecko)Chrome/98.0.4758.102Safari/537.36",
     }
-    captcha = requests.get(
-        "https://centro.zjlll.net/ajax?&service=/centro/api/authcode/create&params=",
-        headers=captcha_headers,
-    ).json()["data"]
-    #    img_bytes = base64.b64de(b64_img)
-    #   with open("test.jpg", 'wb') as f:
-    #         f.write(img_bytes)
-    return captcha
-
+    # 增加循环重试机制，防止单次请求失败导致整个程序崩溃
+    while True:
+        try:
+            captcha = requests.get(
+                "https://centro.zjlll.net/ajax?&service=/centro/api/authcode/create&params=",
+                headers=captcha_headers,
+                verify=False,  # 跳过证书验证
+                timeout=10  # 设置超时时间
+            ).json()["data"]
+            return captcha
+        except Exception as e:
+            print(f"⚠️ 获取验证码失败，正在重试... 错误: {e}")
+            import time
+            time.sleep(2)  # 等待2秒后重试
 
 class ZJOOC:
     def __init__(self, username="", pwd=""):
-        # user = requests.session() session 实例化后可以不用一直填写 Header 和 cookies 太懒了不想改了
         self.session = requests.Session()
         self.session.verify = False
         self._batch_dict = dict()
@@ -41,6 +47,14 @@ class ZJOOC:
 
     def login(self, username="", pwd="") -> None:
         login_res: dict = {}
+        
+        # 伪装成浏览器的请求头，防止被学校防火墙(WAF)拦截
+        login_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36",
+            "Referer": "https://www.zjooc.cn/",
+            "Origin": "https://www.zjooc.cn",
+        }
+
         while True:
             captcha_data = get_captcha()
             captcha_id = captcha_data["id"]  # 验证码ID
@@ -57,13 +71,21 @@ class ZJOOC:
                 "app_key": "0f4cbab4-84ee-48c3-ba4c-874578754b29",
                 "utoLoginTime": "7",
             }
-            # FIXME 这里并没有做异常处理 一般情况下你账号密码正确 没有什么问题 可能验证码错误重试即可。
+            
             try:
-                login_res = self.session.post(
-                    "https://centro.zjlll.net/login/doLogin", data=login_data
-                ).json()
+                # 接收完整的响应对象，并带上伪装头
+                response = self.session.post(
+                    "https://centro.zjlll.net/login/doLogin", 
+                    data=login_data, 
+                    headers=login_headers
+                )
+                # 尝试解析 JSON
+                login_res = response.json()
             except Exception as ex:
-                pprint(ex)
+                # 如果解析失败，把服务器返回的真实 HTML 或文本打印出来，方便排查
+                print("\n=============== 服务器拒绝登录，返回的原始数据 ===============")
+                print(response.text)
+                print("=============================================================\n")
                 print("Login failed.")
                 break
 
@@ -73,15 +95,15 @@ class ZJOOC:
                 continue
 
         login_param = {
-            # 'time': 'm6kxkKnDKxj7kP6yziFQiB8JcAXrsBC41646796129000',
-            # time 可以不传 是一个时间戳加密后的数据
             "auth_code": login_res.get("authorization_code", ""),
             "autoLoginTime": "7",
         }
-        self.session.get("https://www.zjooc.cn/autoLogin", params=login_param)
-        print("Login success.")
-        # # dict_from_cookiejar 把cookies 对象 转换为python dict
-        # self._cookies = requests.utils.dict_from_cookiejar(login_res.cookies)
+        
+        try:
+            self.session.get("https://www.zjooc.cn/autoLogin", params=login_param, verify=False)
+            print("Login success.")
+        except Exception as e:
+            print("自动登录跳转失败，但可能已经获取了基础 Cookie:", e)
 
     @property
     def infomsg(self) -> dict:
@@ -126,7 +148,6 @@ class ZJOOC:
             for i in range(len(course_msg_data))
         ]
 
-        # 获取课程id对应的batchid
         self._batch_dict = {
             course_msg_data[i]["id"]: course_msg_data[i]["batchId"]
             for i in range(len(course_msg_data))
@@ -135,11 +156,6 @@ class ZJOOC:
         return course_lst
 
     def _get_msg(self, modes: str | int) -> list:
-        """
-        :param mode: 0-测验 1-考试 2-作业
-        :return:  [{}]
-        """
-        # assert modes in (0, 1, 2)
         modes = str(modes)
         msg_lst: list = []
         for mode in modes:
@@ -250,16 +266,6 @@ class ZJOOC:
         return video_msg
 
     def do_video(self, course_id):
-        """
-        This function performs a video operation for a given course ID.
-
-        Parameters:
-            course_id (int): The ID of the course for which the video operation is performed.
-
-        Returns:
-            None
-        """
-        # 手动填入要做的video 的 courseid
         if not course_id:
             return
 
@@ -301,17 +307,6 @@ class ZJOOC:
         print("all done!")
 
     def get_an(self, paperId, course_id) -> dict:
-        """
-        Retrieves the answer data for a given paper ID and course ID.
-
-        Args:
-            paperId (int): The ID of the paper.
-            course_id (int): The ID of the course.
-
-        Returns:
-            dict: A dictionary containing the answer data, where the keys are the IDs of the answer data
-                and the values are the corresponding right answers.
-        """
         if not all([paperId, course_id]):
             return {}
 
@@ -320,7 +315,6 @@ class ZJOOC:
             answer_data = {
                 "service": "/tkksxt/api/student/score/scoreDetail",
                 "body": "true",
-                # FIXME 默认为 20231
                 "params[batchKey]": self._batch_dict.get(course_id, 20231),
                 "params[paperId]": paperId,
                 "params[courseId]": course_id,
@@ -350,9 +344,7 @@ class ZJOOC:
         if not all([paper_id, course_id, class_id]):
             return
 
-        # 获取题目答案
         paper_an_data = self.get_an(paper_id, course_id)
-        # 申请答题
         answesparams = {
             "service": "/tkksxt/api/admin/paper/getPaperInfo",
             "params[paperId]": paper_id,
@@ -392,13 +384,7 @@ class ZJOOC:
         except requests.RequestException:
             print("Failed to send data!!")
 
-    
-    
     def do_ans(self):
-        """
-        # FIX 谨慎使用！！！
-        """
-    
         messages_lst = [self.exammsg, self.hwmsg, self.quizemsg]
         paper_cnt = sum(len(msg) for msg in messages_lst)
         for idx, msg in enumerate(chain(*messages_lst)):
@@ -411,6 +397,7 @@ class ZJOOC:
                 progress = idx / paper_cnt
                 progress_bar = f"{'😎' * int(progress * 10)}{'--' * (10 - int(progress * 10))}[{progress:.0%}]"
                 print("\r", progress_bar, end="")
+
     def paser(self, commands: str):
         command_list = commands.split()
 
@@ -421,15 +408,6 @@ class ZJOOC:
         try:
             match command_list[0]:
                 case "msg":
-                    """
-                    0-测验 1-考试 2-作业
-                    3-info 4-course 5-score
-                    6-video 7-an
-                    ex:
-                        msg 0
-                        msg 6 course_id
-                        msg 7 paperId course_id
-                    """
                     match command_list[1]:
                         case "0" | "1" | "2":
                             pprint(self._get_msg(command_list[1]))
@@ -447,13 +425,6 @@ class ZJOOC:
                         case "7":
                             self.get_an(command_list[2], command_list[3])
                 case "do":
-                    """
-                    0-测验、考试、作业 1-video 2-all[not suggest!!!]
-                    ex：
-                        do 0 paper_id course_id class_id
-                        do 1 course_id
-                        do 2 #FIX 谨慎使用！！！
-                    """
                     match command_list[1]:
                         case "0":
                             self.do_an(
